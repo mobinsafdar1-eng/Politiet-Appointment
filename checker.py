@@ -25,8 +25,8 @@ BOOKING_URL = os.environ["BOOKING_URL"]
 BOOKING_NUMBER = os.environ["BOOKING_NUMBER"].strip()
 BOOKING_EMAIL = os.environ["BOOKING_EMAIL"].strip()
 AUTO_BOOK = os.environ.get("AUTO_BOOK", "true").lower() == "true"
-DATE_FROM = date.fromisoformat(os.environ.get("DATE_FROM") or "2026-12-15")
-DATE_TO = date.fromisoformat(os.environ.get("DATE_TO") or "2026-12-30")
+DATE_FROM = date.fromisoformat(os.environ.get("DATE_FROM") or "2026-12-30")
+DATE_TO = date.fromisoformat(os.environ.get("DATE_TO") or "2027-01-15")
 
 STATE_DIR = Path("state")
 SHOT_DIR = Path("shots")
