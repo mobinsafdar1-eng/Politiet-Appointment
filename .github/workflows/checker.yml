@@ -65,8 +65,8 @@ jobs:
           BOOKING_URL: ${{ secrets.BOOKING_URL }}
           BOOKING_EMAIL: ${{ secrets.BOOKING_EMAIL }}   # NEW secret: email used on the booking
           AUTO_BOOK: ${{ vars.AUTO_BOOK || 'true' }}
-          DATE_FROM: ${{ vars.DATE_FROM || '2026-12-15' }}
-          DATE_TO: ${{ vars.DATE_TO || '2026-12-30' }}
+          DATE_FROM: ${{ vars.DATE_FROM || '2026-12-30' }}
+          DATE_TO: ${{ vars.DATE_TO || '2027-01-15' }}
           IMAP_HOST: ${{ vars.IMAP_HOST }}
           SMTP_HOST: ${{ vars.SMTP_HOST }}
           GH_TOKEN: ${{ github.token }}
