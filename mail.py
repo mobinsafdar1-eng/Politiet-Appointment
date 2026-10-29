@@ -9,6 +9,7 @@ import ssl
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -50,11 +51,24 @@ def _text_of(msg):
 
 
 def _find_code(text):
-    m = re.search(r"(?:kode|code|verifi\w*)\D{0,40}(\d{4,8})", text, re.I)
-    if m:
-        return m.group(1)
-    m = re.search(r"\b(\d{6})\b", text)
-    return m.group(1) if m else None
+    # Police emails look like: "Din kode: J03DUJ" (letters AND digits)
+    patterns = [
+        r"(?:din kode|your code)\s*:\s*([A-Za-z0-9]{4,8})\b",
+        r"(?:autentisering|authentication|verifikasjonskode|verification code)"
+        r"[^:\n]{0,40}:\s*([A-Za-z0-9]{4,8})\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _subject_of(msg):
+    try:
+        return str(make_header(decode_header(msg.get("Subject", ""))))
+    except Exception:
+        return msg.get("Subject", "") or ""
 
 
 def fetch_code(since, timeout=150, poll=8):
@@ -79,7 +93,7 @@ def fetch_code(since, timeout=150, poll=8):
                     continue
                 if sent < since - timedelta(seconds=60):
                     continue
-                code = _find_code(_text_of(msg))
+                code = _find_code(_subject_of(msg) + "\n" + _text_of(msg))
                 if code:
                     imap.logout()
                     return code
