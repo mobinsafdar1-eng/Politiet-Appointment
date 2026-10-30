@@ -1,8 +1,9 @@
 """Police appointment rescheduler.
 
 Flow: open change-booking page -> enter booking number + email -> read the
-emailed verification code -> enter it -> click "Endre time" -> look for a free
-slot between DATE_FROM and DATE_TO -> book it (or just report it in dry-run).
+emailed verification code -> enter it -> "Finn time" page -> set the date,
+click "Vis timer", read the day buttons ("2027-01-05  2 ledige tider") ->
+pick the earliest free day/time inside DATE_FROM..DATE_TO -> "Bekreft ny tid".
 If nothing is free, close the browser and exit; the schedule retries later.
 
 Modes:  (none) normal | --dry-run | --probe
@@ -13,7 +14,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PWTimeout
@@ -34,14 +35,10 @@ STATE_DIR.mkdir(exist_ok=True)
 SHOT_DIR.mkdir(exist_ok=True)
 STATE_FILE = STATE_DIR / "state.json"
 
-MONTHS = {
-    "januar": 1, "january": 1, "jan": 1, "februar": 2, "february": 2, "feb": 2,
-    "mars": 3, "march": 3, "mar": 3, "april": 4, "apr": 4, "mai": 5, "may": 5,
-    "juni": 6, "june": 6, "jun": 6, "juli": 7, "july": 7, "jul": 7,
-    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
-    "oktober": 10, "october": 10, "okt": 10, "oct": 10,
-    "november": 11, "nov": 11, "desember": 12, "december": 12, "des": 12, "dec": 12,
-}
+LOG = []  # diagnostics about what the slot search saw (included in probe email)
+
+DAY_RX = re.compile(r"(\d{4}-\d{2}-\d{2})\s*(\d+)\s*(?:ledige|available|free)", re.I)
+TIME_RX = re.compile(r"^\s*\d{1,2}[:.]\d{2}\s*$")
 
 
 # ---------- state ----------
@@ -121,6 +118,10 @@ def page_has_error(page):
     return "ikke funnet" in text or "booking was not found" in text or "not found" in text
 
 
+def on_slot_page(page):
+    return page.get_by_text(re.compile(r"Finn time|Find time|Ledige timer|Available times", re.I)).count() > 0
+
+
 # ---------- steps ----------
 def log_in(page):
     page.goto(BOOKING_URL, wait_until="domcontentloaded")
@@ -135,10 +136,10 @@ def log_in(page):
     if page_has_error(page):
         raise RuntimeError("Site says booking not found - check BOOKING_NUMBER / BOOKING_EMAIL")
 
-    box = page.locator(
+    box = page.get_by_label(re.compile(r"verifikasjonskode|verification code", re.I)).or_(page.locator(
         "input[name*=code i], input[name*=kode i], input[id*=code i], "
         "input[id*=kode i], input[autocomplete=one-time-code]"
-    )
+    ))
     try:
         box.first.wait_for(timeout=15000)
     except PWTimeout:
@@ -159,74 +160,112 @@ def log_in(page):
 
 
 def open_change_time(page):
-    # After login the booking is shown; click "Endre time" to open the calendar.
-    if click_button(page, ["Endre time", "Change time", "Endre"]):
+    """After login, make sure we are on the 'Finn time' slot-search page."""
+    if on_slot_page(page):
+        return
+    if click_button(page, ["Endre time", "Change time"]):
         settle(page)
 
 
-def month_of(page):
-    title = page.locator(".ui-datepicker-title").first.inner_text().strip()
-    m = re.search(r"([A-Za-zæøåÆØÅ]+)\.?\s+(\d{4})", title)
-    if not m or m.group(1).lower() not in MONTHS:
-        raise RuntimeError(f"Could not read calendar month from: {title!r}")
-    return int(m.group(2)), MONTHS[m.group(1).lower()]
+def show_week(page, start, button=("Vis timer", "Show times")):
+    """Type `start` into the Dato box and click the given button."""
+    box = page.locator("input[type=date]")
+    if not box.count():
+        box = page.get_by_label(re.compile(r"Dato|Date", re.I))
+    if not box.count():
+        raise RuntimeError("Date box ('Dato') not found on the slot page")
+    box.first.fill(start.isoformat())
+    if not click_button(page, list(button)):
+        raise RuntimeError(f"Button {button[0]!r} not found on the slot page")
+    settle(page)
+    page.wait_for_timeout(800)
 
 
-def go_next_month(page):
-    nxt = page.locator(".ui-datepicker-next:not(.ui-state-disabled)")
-    if not nxt.count():
-        return False
-    nxt.first.click()
-    page.wait_for_timeout(600)
-    return True
+def read_tabs(page):
+    """Return [(date, free_count, element)] for the day buttons currently shown."""
+    loc = page.get_by_text(re.compile(r"\d{4}-\d{2}-\d{2}\s*\d+\s*(?:ledige|available|free)", re.I))
+    out, seen = [], set()
+    for i in range(loc.count()):
+        el = loc.nth(i)
+        m = DAY_RX.search(" ".join(el.inner_text().split()))
+        if m and m.group(1) not in seen:
+            seen.add(m.group(1))
+            out.append((date.fromisoformat(m.group(1)), int(m.group(2)), el))
+    return sorted(out, key=lambda t: t[0])
 
 
-def free_days_this_month(page):
-    y, m = month_of(page)
-    cells = page.locator(
-        ".ui-datepicker-calendar td:not(.ui-datepicker-unselectable):not(.ui-state-disabled) a"
-    )
-    out = []
-    for i in range(cells.count()):
-        txt = cells.nth(i).inner_text().strip()
-        if txt.isdigit():
-            out.append((date(y, m, int(txt)), cells.nth(i)))
-    return out
+def choose_time(page, d, el):
+    """Click the day button, then the first time button. Returns the time text."""
+    el.click()
+    settle(page)
+    page.wait_for_timeout(800)
+    times = page.get_by_role("button", name=TIME_RX)
+    if not times.count():
+        times = page.get_by_text(TIME_RX)
+    if not times.count():
+        raise RuntimeError(f"Day {d} clicked but no time buttons found")
+    label = times.first.inner_text().strip()
+    times.first.click()
+    page.wait_for_timeout(800)
+    return label
+
+
+def scan_weeks(page, select):
+    """Fallback: scan week by week from DATE_FROM to DATE_TO using 'Vis timer'."""
+    found, cursor = [], DATE_FROM
+    for _ in range(8):
+        if cursor > DATE_TO:
+            break
+        show_week(page, cursor)
+        tabs = read_tabs(page)
+        LOG.append(f"Week scan from {cursor}: " +
+                   (", ".join(f"{d} ({n})" for d, n, _ in tabs) or "no day buttons found"))
+        if not tabs:
+            break
+        for d, n, el in tabs:
+            if DATE_FROM <= d <= DATE_TO and n > 0:
+                found.append(f"{d} ({n} free)")
+                if select:
+                    return d, choose_time(page, d, el), found
+        last = tabs[-1][0]
+        if last < cursor:
+            break
+        cursor = last + timedelta(days=1)
+    return None, None, found
 
 
 def find_and_pick(page, select):
-    """Walk the calendar from DATE_FROM's month to DATE_TO's month.
-    select=False: just list free dates in range. select=True: click the earliest."""
-    if not page.locator(".ui-datepicker-title").count():
-        raise RuntimeError("Calendar not found on the page - selectors need adjusting (see probe email)")
-    for _ in range(12):  # move forward to the first month of the range
-        if month_of(page) >= (DATE_FROM.year, DATE_FROM.month):
-            break
-        if not go_next_month(page):
-            break
-    found = []
-    for _ in range(4):
-        ym = month_of(page)
-        if ym > (DATE_TO.year, DATE_TO.month):
-            break
-        days = [(d, el) for d, el in free_days_this_month(page) if DATE_FROM <= d <= DATE_TO]
-        found += [d for d, _ in days]
-        if select and days:
-            d, el = min(days, key=lambda x: x[0])
-            el.click()
-            page.wait_for_timeout(1000)
-            times = page.get_by_role("button", name=re.compile(r"^\s*\d{1,2}[:.]\d{2}"))
-            if not times.count():
-                times = page.locator("text=/^\\s*\\d{1,2}[:.]\\d{2}\\s*$/")
-            if not times.count():
-                raise RuntimeError(f"Date {d} clicked but no time slots found")
-            label = times.first.inner_text().strip()
-            times.first.click()
-            page.wait_for_timeout(800)
-            return d, label, found
-        if not go_next_month(page):
-            break
-    return None, None, found
+    """Your manual steps: set Dato = DATE_FROM, click 'Vis første ledige time'.
+    If the first free day is inside DATE_FROM..DATE_TO, pick it; otherwise do nothing."""
+    if not on_slot_page(page):
+        raise RuntimeError("Slot search page ('Finn time') not found - see probe screenshot")
+    show_week(page, DATE_FROM, button=("Vis første ledige time", "Show first available"))
+    tabs = read_tabs(page)
+    LOG.append(f"After 'Vis første ledige time' (date {DATE_FROM}): " +
+               (", ".join(f"{d} ({n})" for d, n, _ in tabs) or "no day buttons found"))
+    cands = [(d, n, el) for d, n, el in tabs if d >= DATE_FROM and n > 0]
+    if cands:
+        d, n, el = cands[0]
+        if d > DATE_TO:
+            LOG.append(f"Earliest free day {d} is after {DATE_TO} - outside the range.")
+            return None, None, []
+        if select:
+            return d, choose_time(page, d, el), [f"{d} ({n} free)"]
+        return None, None, [f"{d} ({n} free)"]
+    LOG.append("First-available result not readable; falling back to week-by-week scan.")
+    return scan_weeks(page, select)
+
+
+def end_session(page):
+    """Click 'Avslutt økten' (end session) so the site session is closed cleanly."""
+    try:
+        if click_button(page, ["Avslutt økten", "End session"]):
+            settle(page)
+        else:
+            page.goto("https://politietbooking.nemo-q.se/Booking/Booking/Restart/Avtale",
+                      wait_until="domcontentloaded")
+    except Exception as e:
+        print(f"[end_session] could not close session: {e}")
 
 
 def disable_workflow():
@@ -249,26 +288,32 @@ def run(probe, dry_run):
                                   viewport={"width": 1280, "height": 1000})
         ctx.set_default_timeout(30000)
         page = ctx.new_page()
+        page.on("dialog", lambda d: d.accept())
         try:
             log_in(page)
             open_change_time(page)
 
             if probe:
-                files = snap(page, "probe-calendar")
+                files = snap(page, "probe-start")
                 found = []
                 try:
                     _, _, found = find_and_pick(page, select=False)
+                    files += snap(page, "probe-after-search")
                 except Exception as e:
-                    found = [f"(could not read calendar: {e})"]
+                    LOG.append(f"(could not search: {e})")
+                    files += snap(page, "probe-error")
                 notify("Appointment checker: probe OK",
-                       f"Logged in and reached the next page.\nFree dates in "
-                       f"{DATE_FROM}..{DATE_TO}: {found or 'none'}\n"
-                       "Screenshot and HTML attached.", files)
+                       f"Logged in and reached the slot page.\n"
+                       f"Range: {DATE_FROM}..{DATE_TO}\n"
+                       f"Free days in range: {found or 'none'}\n\n"
+                       "What the search saw:\n" + "\n".join(LOG) +
+                       "\n\nScreenshots and HTML attached.", files)
                 return
 
             d, label, found = find_and_pick(page, select=True)
             if not d:
-                print(f"No free slot between {DATE_FROM} and {DATE_TO}. Closing; will retry next run.")
+                print(f"No free slot between {DATE_FROM} and {DATE_TO}. "
+                      f"Searched: {LOG}. Closing; will retry next run.")
                 st["last_check"] = datetime.now(timezone.utc).isoformat()
                 st["fails"] = 0
                 save_state(st)
@@ -281,18 +326,20 @@ def run(probe, dry_run):
                        "Selected but NOT booked (dry-run / AUTO_BOOK off).", files)
                 return
 
-            if not click_button(page, ["Bekreft", "Book", "Lagre", "Fullfør",
-                                       "Endre time", "Confirm", "Save"]):
-                raise RuntimeError(f"Selected {d} {label} but found no confirm button")
+            if not click_button(page, ["Bekreft ny tid", "Confirm new time"]):
+                raise RuntimeError(f"Selected {d} {label} but found no 'Bekreft ny tid' button")
             settle(page)
+            page.wait_for_timeout(1500)
             files = snap(page, "after-confirm")
             body = page.inner_text("body").lower()
-            ok = re.search(r"bekreft|endret|kvittering|confirmed|changed|booked", body)
+            still_form = page.get_by_role("button", name=re.compile("Bekreft ny tid", re.I)).count() > 0
+            ok = (not still_form) and re.search(
+                r"er endret|endret|kvittering|bekreftelse|confirmation|has been changed|confirmed", body)
             st["booked"] = True
             st["booked_slot"] = f"{d} {label}"
             save_state(st)
             notify(f"Appointment checker: {'BOOKED' if ok else 'CHECK NEEDED'} {d} {label}",
-                   ("The new time was booked." if ok else
+                   ("The new time appears to be booked." if ok else
                     "Confirm was clicked but I could not see a clear confirmation. "
                     "Please verify on the police site / your email.") +
                    "\nThe checker has been switched off.", files)
@@ -307,6 +354,7 @@ def run(probe, dry_run):
             print(f"ERROR: {e}")
             sys.exit(1)
         finally:
+            end_session(page)
             browser.close()
 
 
