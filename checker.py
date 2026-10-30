@@ -1,10 +1,10 @@
 """Police appointment rescheduler.
 
 Flow: open change-booking page -> enter booking number + email -> read the
-emailed verification code -> enter it -> "Finn time" page -> set the date,
-click "Vis timer", read the day buttons ("2027-01-05  2 ledige tider") ->
-pick the earliest free day/time inside DATE_FROM..DATE_TO -> "Bekreft ny tid".
-If nothing is free, close the browser and exit; the schedule retries later.
+emailed verification code -> enter it -> "Finn time" page -> set Dato to
+DATE_FROM, click "Vis første ledige time" ONCE -> if the earliest free day is
+inside DATE_FROM..DATE_TO, pick it and click "Bekreft ny tid" and email you.
+Otherwise end the session silently (no email); the schedule retries later.
 
 Modes:  (none) normal | --dry-run | --probe
 """
@@ -36,6 +36,7 @@ SHOT_DIR.mkdir(exist_ok=True)
 STATE_FILE = STATE_DIR / "state.json"
 
 LOG = []  # diagnostics about what the slot search saw (included in probe email)
+UNREADABLE = []  # filled when the site showed no day buttons at all
 
 DAY_RX = re.compile(r"(\d{4}-\d{2}-\d{2})\s*(\d+)\s*(?:ledige|available|free)", re.I)
 TIME_RX = re.compile(r"^\s*\d{1,2}[:.]\d{2}\s*$")
@@ -195,43 +196,40 @@ def read_tabs(page):
 
 
 def choose_time(page, d, el):
-    """Click the day button, then the first time button. Returns the time text."""
-    el.click()
-    settle(page)
-    page.wait_for_timeout(800)
+    """Pick the first time listed under day d's own column. Returns the time text."""
+    box = el.bounding_box()
+    try:
+        el.click()  # harmless if the day header is not clickable
+        settle(page)
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
     times = page.get_by_role("button", name=TIME_RX)
     if not times.count():
         times = page.get_by_text(TIME_RX)
-    if not times.count():
-        raise RuntimeError(f"Day {d} clicked but no time buttons found")
-    label = times.first.inner_text().strip()
-    times.first.click()
+    n = times.count()
+    if not n:
+        raise RuntimeError(f"Day {d}: no time buttons found")
+    pick = None
+    if box:
+        best = None
+        for i in range(n):
+            b = times.nth(i).bounding_box()
+            if not b:
+                continue
+            cx = b["x"] + b["width"] / 2
+            if box["x"] - 2 <= cx <= box["x"] + box["width"] + 2 and b["y"] >= box["y"]:
+                if best is None or b["y"] < best[0]:
+                    best = (b["y"], i)
+        if best:
+            pick = best[1]
+    if pick is None:
+        pick = 0
+        LOG.append(f"Could not match a time to day {d}'s column; used the first time on the page.")
+    label = times.nth(pick).inner_text().strip()
+    times.nth(pick).click()
     page.wait_for_timeout(800)
     return label
-
-
-def scan_weeks(page, select):
-    """Fallback: scan week by week from DATE_FROM to DATE_TO using 'Vis timer'."""
-    found, cursor = [], DATE_FROM
-    for _ in range(8):
-        if cursor > DATE_TO:
-            break
-        show_week(page, cursor)
-        tabs = read_tabs(page)
-        LOG.append(f"Week scan from {cursor}: " +
-                   (", ".join(f"{d} ({n})" for d, n, _ in tabs) or "no day buttons found"))
-        if not tabs:
-            break
-        for d, n, el in tabs:
-            if DATE_FROM <= d <= DATE_TO and n > 0:
-                found.append(f"{d} ({n} free)")
-                if select:
-                    return d, choose_time(page, d, el), found
-        last = tabs[-1][0]
-        if last < cursor:
-            break
-        cursor = last + timedelta(days=1)
-    return None, None, found
 
 
 def find_and_pick(page, select):
@@ -252,8 +250,12 @@ def find_and_pick(page, select):
         if select:
             return d, choose_time(page, d, el), [f"{d} ({n} free)"]
         return None, None, [f"{d} ({n} free)"]
-    LOG.append("First-available result not readable; falling back to week-by-week scan.")
-    return scan_weeks(page, select)
+    if not tabs:
+        UNREADABLE.append(True)
+        LOG.append("No day buttons were shown after 'Vis første ledige time'.")
+    else:
+        LOG.append(f"No free day on/after {DATE_FROM} in the results shown.")
+    return None, None, []
 
 
 def end_session(page):
@@ -316,7 +318,13 @@ def run(probe, dry_run):
                       f"Searched: {LOG}. Closing; will retry next run.")
                 st["last_check"] = datetime.now(timezone.utc).isoformat()
                 st["fails"] = 0
+                st["unreadable"] = (st.get("unreadable", 0) + 1) if UNREADABLE else 0
                 save_state(st)
+                if st["unreadable"] >= 4:  # safety net: page layout may have changed
+                    notify("Appointment checker: cannot read results",
+                           "The site showed no readable results 4 runs in a row. "
+                           "The page may have changed. Screenshot attached.",
+                           snap(page, "unreadable"), key="unreadable", every_hours=24)
                 return
 
             files = snap(page, "slot-selected")
@@ -349,8 +357,10 @@ def run(probe, dry_run):
             st = load_state()
             st["fails"] = st.get("fails", 0) + 1
             save_state(st)
-            notify("Appointment checker: problem", f"{e}\n\nScreenshot and HTML attached.",
-                   files, key=f"err-{str(e)[:40]}")
+            if st["fails"] >= 3:  # no email for one-off glitches
+                notify("Appointment checker: problem (3 failed runs in a row)",
+                       f"{e}\n\nScreenshot and HTML attached.",
+                       files, key="repeated-failure", every_hours=24)
             print(f"ERROR: {e}")
             sys.exit(1)
         finally:
