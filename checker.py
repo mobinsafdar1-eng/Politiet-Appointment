@@ -1,21 +1,29 @@
-"""Police appointment rescheduler.
+"""Police appointment rescheduler for several bookings.
 
-Flow: open change-booking page -> enter booking number + email -> read the
-emailed verification code -> enter it -> "Finn time" page -> set Dato to
-DATE_FROM, click "Vis første ledige time" ONCE -> if the earliest free day is
-inside DATE_FROM..DATE_TO, pick it and click "Bekreft ny tid" and email you.
-Otherwise end the session silently (no email); the schedule retries later.
+BOOKINGS secret, one person per line:   Name,BookingNumber[,Email[,CurrentDate]]
+(blank email = the BOOKING_EMAIL secret). The first line is "you".
+
+Each wake-up:
+  1. One booking scouts: logs in, reads its appointment date, clicks
+     "Vis første ledige time" once and notes which days have free slots.
+     If a slot is earlier than its own date it books it.
+  2. Any OTHER booking logs in only if a slot shown is earlier than its date,
+     and books it. Several free slots -> several bookings, one by one.
+  3. Hard daily caps: DAILY_MAX_TOTAL logins (48) and DAILY_MAX_PER_PERSON (12).
+Only strictly earlier dates are ever booked. Emails only when something is found.
 
 Modes:  (none) normal | --dry-run | --probe
 """
 import argparse
 import json
 import os
+import random
 import re
-import subprocess
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
@@ -23,11 +31,12 @@ from playwright.sync_api import sync_playwright
 import mail
 
 BOOKING_URL = os.environ["BOOKING_URL"]
-BOOKING_NUMBER = os.environ["BOOKING_NUMBER"].strip()
-BOOKING_EMAIL = os.environ["BOOKING_EMAIL"].strip()
 AUTO_BOOK = os.environ.get("AUTO_BOOK", "true").lower() == "true"
 DATE_FROM = date.fromisoformat(os.environ.get("DATE_FROM") or "2026-12-30")
-DATE_TO = date.fromisoformat(os.environ.get("DATE_TO") or "2027-01-15")
+DATE_CAP = date.fromisoformat(os.environ.get("DATE_TO") or "2027-01-31")
+MAX_TOTAL = int(os.environ.get("DAILY_MAX_TOTAL") or 48)         # logins per day, all bookings
+MAX_PER_PERSON = int(os.environ.get("DAILY_MAX_PER_PERSON") or 12)  # logins per day, per booking
+START_JITTER = int(os.environ.get("START_JITTER_SECONDS") or 120)
 
 STATE_DIR = Path("state")
 SHOT_DIR = Path("shots")
@@ -35,36 +44,101 @@ STATE_DIR.mkdir(exist_ok=True)
 SHOT_DIR.mkdir(exist_ok=True)
 STATE_FILE = STATE_DIR / "state.json"
 
-LOG = []  # diagnostics about what the slot search saw (included in probe email)
-UNREADABLE = []  # filled when the site showed no day buttons at all
+LOG = []         # diagnostics for the current person
+UNREADABLE = []  # set when the site showed no day buttons at all
+SEEN = []        # [(day, free_count)] shown by the last 'Vis første ledige time'
+STATE = {}
 
 DAY_RX = re.compile(r"(\d{4}-\d{2}-\d{2})\s*(\d+)\s*(?:ledige|available|free)", re.I)
 TIME_RX = re.compile(r"^\s*\d{1,2}[:.]\d{2}\s*$")
+MONTHS = {
+    "januar": 1, "january": 1, "februar": 2, "february": 2, "mars": 3, "march": 3,
+    "april": 4, "mai": 5, "may": 5, "juni": 6, "june": 6, "juli": 7, "july": 7,
+    "august": 8, "september": 9, "oktober": 10, "october": 10,
+    "november": 11, "desember": 12, "december": 12,
+}
 
 
-# ---------- state ----------
-def load_state():
+# ---------- people & state ----------
+def load_people():
+    default_email = os.environ.get("BOOKING_EMAIL", "").strip()
+    people = []
+    for line in (os.environ.get("BOOKINGS") or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [x.strip() for x in line.split(",")]
+        email = (parts[2] if len(parts) > 2 else "") or default_email
+        if len(parts) < 2 or not parts[1] or not email:
+            print("[config] skipping a malformed BOOKINGS line (needs: Name,BookingNumber[,Email[,Date]])")
+            continue
+        people.append({"name": parts[0], "ref": parts[1], "email": email,
+                       "hint": to_date(parts[3]) if len(parts) > 3 else None})
+    if not people and os.environ.get("BOOKING_NUMBER") and default_email:
+        people.append({"name": "Main", "ref": os.environ["BOOKING_NUMBER"].strip(),
+                       "email": default_email, "hint": None})
+    return people
+
+
+def to_date(v):
     try:
-        return json.loads(STATE_FILE.read_text())
+        return date.fromisoformat(v) if isinstance(v, str) and v else None
+    except ValueError:
+        return None
+
+
+def load_state():
+    global STATE
+    try:
+        STATE = json.loads(STATE_FILE.read_text())
     except Exception:
-        return {}
+        STATE = {}
 
 
-def save_state(st):
-    STATE_FILE.write_text(json.dumps(st, indent=2))
+def save_state():
+    STATE_FILE.write_text(json.dumps(STATE, indent=2))
+
+
+def pstate(p):
+    ps = STATE.setdefault("people", {}).setdefault(p["ref"], {})
+    legacy = os.environ.get("BOOKING_NUMBER", "").strip()
+    if p["ref"] == legacy and not ps.get("booked_date"):  # from the older single-booking version
+        bd = STATE.get("booked_date") or (STATE.get("booked_slot") or "")[:10]
+        if to_date(bd):
+            ps["booked_date"] = bd
+    return ps
+
+
+def logins_today():
+    day = datetime.now(ZoneInfo("Europe/Oslo")).date().isoformat()
+    L = STATE.setdefault("logins", {})
+    if L.get("day") != day:
+        L.clear()
+        L.update({"day": day, "total": 0, "by": {}})
+    return L
+
+
+def can_login(p):
+    L = logins_today()
+    return L["total"] < MAX_TOTAL and L["by"].get(p["ref"], 0) < MAX_PER_PERSON
+
+
+def count_login(p):
+    L = logins_today()
+    L["total"] += 1
+    L["by"][p["ref"]] = L["by"].get(p["ref"], 0) + 1
+    save_state()
 
 
 def notify(subject, body, files=(), key=None, every_hours=6):
-    """Send an email; if `key` is given, send at most once per `every_hours`."""
-    st = load_state()
-    now = datetime.now(timezone.utc).timestamp()
     if key:
-        last = st.get("notices", {}).get(key, 0)
-        if now - last < every_hours * 3600:
+        now = datetime.now(timezone.utc).timestamp()
+        notices = STATE.setdefault("notices", {})
+        if now - notices.get(key, 0) < every_hours * 3600:
             print(f"[notify] skipped (throttled): {subject}")
             return
-        st.setdefault("notices", {})[key] = now
-        save_state(st)
+        notices[key] = now
+        save_state()
     try:
         mail.send_mail(subject, body, files)
     except Exception as e:
@@ -124,18 +198,17 @@ def on_slot_page(page):
 
 
 # ---------- steps ----------
-def log_in(page):
+def log_in(page, p):
     page.goto(BOOKING_URL, wait_until="domcontentloaded")
     settle(page)
-    fill_field(page, ["Bookingnummer", "Booking number"], BOOKING_NUMBER, 0)
-    fill_field(page, ["E-post", "E-mail", "Email"], BOOKING_EMAIL, 1)
+    fill_field(page, ["Bookingnummer", "Booking number"], p["ref"], 0)
+    fill_field(page, ["E-post", "E-mail", "Email"], p["email"], 1)
     requested_at = datetime.now(timezone.utc)
     if not click_button(page, ["Endre time", "Change"]):
         raise RuntimeError("Could not find the 'Endre time' button on the login form")
     settle(page)
-
     if page_has_error(page):
-        raise RuntimeError("Site says booking not found - check BOOKING_NUMBER / BOOKING_EMAIL")
+        raise RuntimeError("Site says booking not found - check the booking number / email")
 
     box = page.get_by_label(re.compile(r"verifikasjonskode|verification code", re.I)).or_(page.locator(
         "input[name*=code i], input[name*=kode i], input[id*=code i], "
@@ -146,11 +219,10 @@ def log_in(page):
     except PWTimeout:
         print("[login] no code box appeared; continuing")
         return
-    print("[login] waiting for verification code email...")
-    code = mail.fetch_code(requested_at)
+    code = mail.fetch_code(requested_at, p["ref"])
     if not code:
         raise RuntimeError("Verification code email did not arrive in time "
-                           "(check GMAIL_ADDRESS receives mail sent to the booking email)")
+                           "(the booking email must be readable by GMAIL_ADDRESS)")
     box.first.fill(code)
     if not click_button(page, ["Bekreft", "Verifiser", "Fortsett", "Neste",
                                "Verify", "Confirm", "Continue", "Logg inn", "^OK$"]):
@@ -160,16 +232,41 @@ def log_in(page):
         raise RuntimeError("Site rejected the verification code")
 
 
+def read_current_date(page):
+    """Best-effort: the appointment date shown right after login (before the slot list)."""
+    text = page.inner_text("body")
+    cut = re.search(r"Ledige timer|Available times", text, re.I)
+    if cut:
+        text = text[:cut.start()]
+    LOG.append(f"Page text after login: {' '.join(text.split())[:500]!r}")
+    found = []
+    for m in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", text):
+        found.append((int(m[1]), int(m[2]), int(m[3])))
+    for m in re.finditer(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b", text):
+        found.append((int(m[3]), int(m[2]), int(m[1])))
+    for m in re.finditer(r"\b(\d{1,2})\.?\s+([A-Za-zæøåÆØÅ]+)\s+(\d{4})\b", text):
+        mo = MONTHS.get(m[2].lower())
+        if mo:
+            found.append((int(m[3]), mo, int(m[1])))
+    today, out = date.today(), []
+    for y, mo, d in found:
+        try:
+            dd = date(y, mo, d)
+        except ValueError:
+            continue
+        if today <= dd <= date(2028, 12, 31):
+            out.append(dd)
+    return min(out) if out else None
+
+
 def open_change_time(page):
-    """After login, make sure we are on the 'Finn time' slot-search page."""
     if on_slot_page(page):
         return
     if click_button(page, ["Endre time", "Change time"]):
         settle(page)
 
 
-def show_week(page, start, button=("Vis timer", "Show times")):
-    """Type `start` into the Dato box and click the given button."""
+def show_week(page, start, button):
     box = page.locator("input[type=date]")
     if not box.count():
         box = page.get_by_label(re.compile(r"Dato|Date", re.I))
@@ -183,7 +280,6 @@ def show_week(page, start, button=("Vis timer", "Show times")):
 
 
 def read_tabs(page):
-    """Return [(date, free_count, element)] for the day buttons currently shown."""
     loc = page.get_by_text(re.compile(r"\d{4}-\d{2}-\d{2}\s*\d+\s*(?:ledige|available|free)", re.I))
     out, seen = [], set()
     for i in range(loc.count()):
@@ -195,11 +291,32 @@ def read_tabs(page):
     return sorted(out, key=lambda t: t[0])
 
 
+def find_slot(page, date_to):
+    """One click of 'Vis første ledige time'. Returns (day, count, element) if the
+    earliest free day is inside DATE_FROM..date_to, else None."""
+    if not on_slot_page(page):
+        raise RuntimeError("Slot search page ('Finn time') not found")
+    show_week(page, DATE_FROM, ("Vis første ledige time", "Show first available"))
+    tabs = read_tabs(page)
+    SEEN[:] = [(d, n) for d, n, _ in tabs]
+    LOG.append("After 'Vis første ledige time': " +
+               (", ".join(f"{d} ({n})" for d, n, _ in tabs) or "no day buttons found"))
+    cands = [(d, n, el) for d, n, el in tabs if d >= DATE_FROM and n > 0]
+    if cands:
+        d, n, el = cands[0]
+        if d > date_to:
+            LOG.append(f"Earliest free day {d} is later than the limit {date_to}.")
+            return None
+        return d, n, el
+    if not tabs:
+        UNREADABLE.append(True)
+    return None
+
+
 def choose_time(page, d, el):
-    """Pick the first time listed under day d's own column. Returns the time text."""
     box = el.bounding_box()
     try:
-        el.click()  # harmless if the day header is not clickable
+        el.click()
         settle(page)
         page.wait_for_timeout(500)
     except Exception:
@@ -232,34 +349,7 @@ def choose_time(page, d, el):
     return label
 
 
-def find_and_pick(page, select):
-    """Your manual steps: set Dato = DATE_FROM, click 'Vis første ledige time'.
-    If the first free day is inside DATE_FROM..DATE_TO, pick it; otherwise do nothing."""
-    if not on_slot_page(page):
-        raise RuntimeError("Slot search page ('Finn time') not found - see probe screenshot")
-    show_week(page, DATE_FROM, button=("Vis første ledige time", "Show first available"))
-    tabs = read_tabs(page)
-    LOG.append(f"After 'Vis første ledige time' (date {DATE_FROM}): " +
-               (", ".join(f"{d} ({n})" for d, n, _ in tabs) or "no day buttons found"))
-    cands = [(d, n, el) for d, n, el in tabs if d >= DATE_FROM and n > 0]
-    if cands:
-        d, n, el = cands[0]
-        if d > DATE_TO:
-            LOG.append(f"Earliest free day {d} is after {DATE_TO} - outside the range.")
-            return None, None, []
-        if select:
-            return d, choose_time(page, d, el), [f"{d} ({n} free)"]
-        return None, None, [f"{d} ({n} free)"]
-    if not tabs:
-        UNREADABLE.append(True)
-        LOG.append("No day buttons were shown after 'Vis første ledige time'.")
-    else:
-        LOG.append(f"No free day on/after {DATE_FROM} in the results shown.")
-    return None, None, []
-
-
 def end_session(page):
-    """Click 'Avslutt økten' (end session) so the site session is closed cleanly."""
     try:
         if click_button(page, ["Avslutt økten", "End session"]):
             settle(page)
@@ -270,102 +360,197 @@ def end_session(page):
         print(f"[end_session] could not close session: {e}")
 
 
-def disable_workflow():
-    repo = os.environ.get("GITHUB_REPOSITORY")
-    if repo:
-        subprocess.run(["gh", "api", "-X", "PUT",
-                        f"repos/{repo}/actions/workflows/checker.yml/disable"], check=False)
+# ---------- one person ----------
+def process_person(browser, p, probe, dry_run):
+    name, ps = p["name"], pstate(p)
+    ps["last_checked"] = datetime.now(timezone.utc).isoformat()
+    LOG.clear()
+    UNREADABLE.clear()
+    SEEN.clear()
+
+    pre = [d for d in (p["hint"], to_date(ps.get("booked_date"))) if d]
+    if pre and min(min(pre) - timedelta(days=1), DATE_CAP) < DATE_FROM and not (probe or dry_run):
+        print(f"[{name}] already at the start of the range; nothing earlier possible.")
+        return "none"
+
+    ctx = browser.new_context(locale="nb-NO", timezone_id="Europe/Oslo",
+                              viewport={"width": 1280, "height": 1000})
+    ctx.set_default_timeout(30000)
+    page = ctx.new_page()
+    page.on("dialog", lambda d: d.accept())
+    try:
+        count_login(p)
+        log_in(page, p)
+        on_page = read_current_date(page)
+        known = [d for d in (on_page, p["hint"], to_date(ps.get("booked_date"))) if d]
+        have = min(known) if known else None
+        limit = min(DATE_CAP, have - timedelta(days=1)) if have else DATE_CAP
+        LOG.append(f"Current appointment: {have or 'UNKNOWN'}; searching {DATE_FROM}..{limit}")
+        if have:
+            ps["booked_date"] = have.isoformat()
+        open_change_time(page)
+
+        if probe:
+            files = snap(page, f"probe-{p['ref'][-4:]}")
+            hit = find_slot(page, limit) if limit >= DATE_FROM else None
+            files += snap(page, f"probe-after-{p['ref'][-4:]}")
+            notify(f"[{name}] probe OK",
+                   f"Current appointment: {have or 'UNKNOWN (add it as the 4th column in BOOKINGS)'}\n"
+                   f"Earlier slot in range: {hit[0] if hit else 'none'}\n\n"
+                   "What the run saw:\n" + "\n".join(LOG) + "\n\nScreenshots attached.", files)
+            return "none"
+
+        hit = find_slot(page, limit) if limit >= DATE_FROM else None
+        if not hit:
+            ps["fails"] = 0
+            ps["unreadable"] = (ps.get("unreadable", 0) + 1) if UNREADABLE else 0
+            print(f"[{name}] no earlier slot. {LOG[-1] if LOG else ''}")
+            if ps["unreadable"] >= 4:
+                notify(f"[{name}] cannot read results",
+                       "The site showed no readable results 4 checks in a row; the page may have changed.",
+                       snap(page, "unreadable"), key=f"unreadable-{p['ref']}", every_hours=24)
+            return "none"
+
+        d, n, el = hit
+        label = choose_time(page, d, el)
+        files = snap(page, f"slot-{p['ref'][-4:]}")
+        reason = None
+        if dry_run or not AUTO_BOOK:
+            reason = "dry-run / AUTO_BOOK is off"
+        elif have is None:
+            reason = "the current appointment date could not be read, so auto-booking is blocked for safety"
+        if reason:
+            notify(f"[{name}] earlier slot available {d} {label}",
+                   f"Earlier slot found: {d} at {label} (current: {have or 'unknown'}).\n"
+                   f"Selected but NOT booked: {reason}.", files,
+                   key=f"avail-{p['ref']}-{d}", every_hours=3)
+            return "alert"
+
+        if not click_button(page, ["Bekreft ny tid", "Confirm new time"]):
+            raise RuntimeError(f"Selected {d} {label} but found no 'Bekreft ny tid' button")
+        settle(page)
+        page.wait_for_timeout(1500)
+        files = snap(page, f"confirm-{p['ref'][-4:]}")
+        body = page.inner_text("body").lower()
+        still_form = page.get_by_role("button", name=re.compile("Bekreft ny tid", re.I)).count() > 0
+        ok = (not still_form) and re.search(
+            r"er endret|endret|kvittering|bekreftelse|confirmation|has been changed|confirmed", body)
+        if ok:
+            ps["booked_date"] = d.isoformat()
+        ps["booked_slot"] = f"{d} {label}"
+        ps["fails"] = 0
+        notify(f"[{name}] {'BOOKED' if ok else 'CHECK NEEDED'} {d} {label}",
+               (f"The new time {d} {label} appears to be booked (was {have})." if ok else
+                "Confirm was clicked but I could not see a clear confirmation. "
+                "Please verify on the police site / your email.") +
+               "\nFurther changes for this booking must be earlier than " + str(d) + ".", files)
+        return "booked" if ok else "alert"
+    except Exception as e:
+        files = snap(page, f"error-{p['ref'][-4:]}")
+        ps["fails"] = ps.get("fails", 0) + 1
+        print(f"[{name}] ERROR: {e}")
+        if ps["fails"] >= 3:  # no email for one-off glitches
+            notify(f"[{name}] problem (3 failed checks in a row)",
+                   f"{e}\n\nScreenshot and HTML attached.", files,
+                   key=f"repeated-failure-{p['ref']}", every_hours=24)
+        return "error"
+    finally:
+        end_session(page)
+        ctx.close()
 
 
 # ---------- main ----------
-def run(probe, dry_run):
-    st = load_state()
-    if st.get("booked") and not (probe or dry_run):
-        print("Already booked - nothing to do.")
-        return
+def known_date(p):
+    ps = pstate(p)
+    ds = [d for d in (p["hint"], to_date(ps.get("booked_date"))) if d]
+    return min(ds) if ds else None
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(locale="nb-NO", timezone_id="Europe/Oslo",
-                                  viewport={"width": 1280, "height": 1000})
-        ctx.set_default_timeout(30000)
-        page = ctx.new_page()
-        page.on("dialog", lambda d: d.accept())
+
+def improvable(p):
+    kd = known_date(p)
+    return kd is None or min(kd - timedelta(days=1), DATE_CAP) >= DATE_FROM
+
+
+def eligible(p, remaining):
+    """Is any slot shown earlier than this person's current appointment?"""
+    kd = known_date(p)
+    return any(n > 0 and DATE_FROM <= d <= DATE_CAP and (kd is None or d < kd)
+               for d, n in remaining.items())
+
+
+def take(remaining, p):
+    bd = to_date((pstate(p).get("booked_slot") or "")[:10])
+    if bd in remaining:
+        remaining[bd] = max(0, remaining[bd] - 1)
+
+
+def pick_scout(people):
+    """The booking with the fewest logins today (ties: first in BOOKINGS, i.e. yours)."""
+    L = logins_today()
+    cands = [p for p in people if improvable(p) and can_login(p)]
+    if not cands:
+        return None
+    return min(cands, key=lambda p: (L["by"].get(p["ref"], 0), people.index(p)))
+
+
+def main(probe, dry_run):
+    load_state()
+    people = load_people()
+    if not people:
+        print("No bookings configured (set the BOOKINGS secret).")
+        sys.exit(1)
+    manual = probe or dry_run
+    scout = None
+    if not manual:
+        scout = pick_scout(people)
+        if not scout:
+            L = logins_today()
+            print(f"Nothing to do: daily login limit reached or all bookings at the earliest "
+                  f"date (today {L['total']}/{MAX_TOTAL} logins).")
+            save_state()
+            return
+        time.sleep(random.uniform(0, START_JITTER))  # vary the exact start time
+
+    errors = 0
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
         try:
-            log_in(page)
-            open_change_time(page)
+            def go(p, first):
+                nonlocal errors
+                if not first:
+                    time.sleep(random.uniform(25, 90))  # pause between logins
+                status = process_person(browser, p, probe, dry_run)
+                save_state()
+                if status == "error":
+                    errors += 1
+                return status
 
-            if probe:
-                files = snap(page, "probe-start")
-                found = []
-                try:
-                    _, _, found = find_and_pick(page, select=False)
-                    files += snap(page, "probe-after-search")
-                except Exception as e:
-                    LOG.append(f"(could not search: {e})")
-                    files += snap(page, "probe-error")
-                notify("Appointment checker: probe OK",
-                       f"Logged in and reached the slot page.\n"
-                       f"Range: {DATE_FROM}..{DATE_TO}\n"
-                       f"Free days in range: {found or 'none'}\n\n"
-                       "What the search saw:\n" + "\n".join(LOG) +
-                       "\n\nScreenshots and HTML attached.", files)
-                return
-
-            d, label, found = find_and_pick(page, select=True)
-            if not d:
-                print(f"No free slot between {DATE_FROM} and {DATE_TO}. "
-                      f"Searched: {LOG}. Closing; will retry next run.")
-                st["last_check"] = datetime.now(timezone.utc).isoformat()
-                st["fails"] = 0
-                st["unreadable"] = (st.get("unreadable", 0) + 1) if UNREADABLE else 0
-                save_state(st)
-                if st["unreadable"] >= 4:  # safety net: page layout may have changed
-                    notify("Appointment checker: cannot read results",
-                           "The site showed no readable results 4 runs in a row. "
-                           "The page may have changed. Screenshot attached.",
-                           snap(page, "unreadable"), key="unreadable", every_hours=24)
-                return
-
-            files = snap(page, "slot-selected")
-            if dry_run or not AUTO_BOOK:
-                notify(f"Appointment checker: slot available {d} {label}",
-                       f"Free slot found: {d} at {label}.\n"
-                       "Selected but NOT booked (dry-run / AUTO_BOOK off).", files)
-                return
-
-            if not click_button(page, ["Bekreft ny tid", "Confirm new time"]):
-                raise RuntimeError(f"Selected {d} {label} but found no 'Bekreft ny tid' button")
-            settle(page)
-            page.wait_for_timeout(1500)
-            files = snap(page, "after-confirm")
-            body = page.inner_text("body").lower()
-            still_form = page.get_by_role("button", name=re.compile("Bekreft ny tid", re.I)).count() > 0
-            ok = (not still_form) and re.search(
-                r"er endret|endret|kvittering|bekreftelse|confirmation|has been changed|confirmed", body)
-            st["booked"] = True
-            st["booked_slot"] = f"{d} {label}"
-            save_state(st)
-            notify(f"Appointment checker: {'BOOKED' if ok else 'CHECK NEEDED'} {d} {label}",
-                   ("The new time appears to be booked." if ok else
-                    "Confirm was clicked but I could not see a clear confirmation. "
-                    "Please verify on the police site / your email.") +
-                   "\nThe checker has been switched off.", files)
-            disable_workflow()
-        except Exception as e:
-            files = snap(page, "error")
-            st = load_state()
-            st["fails"] = st.get("fails", 0) + 1
-            save_state(st)
-            if st["fails"] >= 3:  # no email for one-off glitches
-                notify("Appointment checker: problem (3 failed runs in a row)",
-                       f"{e}\n\nScreenshot and HTML attached.",
-                       files, key="repeated-failure", every_hours=24)
-            print(f"ERROR: {e}")
-            sys.exit(1)
+            if manual:
+                for i, p in enumerate(people):
+                    go(p, i == 0)
+            else:
+                # 1) one login scouts the slot list (and books for itself if a slot suits it)
+                status = go(scout, True)
+                remaining = dict(SEEN)
+                if status == "booked":
+                    take(remaining, scout)
+                # 2) log in for another booking ONLY if a shown slot is earlier than its date
+                if status != "error":
+                    for p in people:
+                        if p is scout or not improvable(p) or not can_login(p):
+                            continue
+                        if not eligible(p, remaining):
+                            continue
+                        status = go(p, False)
+                        if SEEN:
+                            remaining = dict(SEEN)
+                        if status == "booked":
+                            take(remaining, p)
         finally:
-            end_session(page)
             browser.close()
+    save_state()
+    if errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -373,4 +558,4 @@ if __name__ == "__main__":
     ap.add_argument("--probe", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
-    run(a.probe, a.dry_run)
+    main(a.probe, a.dry_run)
