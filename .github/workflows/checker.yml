@@ -2,7 +2,14 @@ name: Appointment checker
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # every 30 minutes (GitHub may start runs late when busy)
+    # Irregular wake-up times (UTC; Oslo = UTC+1 in winter). About 45 per day,
+    # fewer at night, with uneven gaps of roughly 12 to 35 minutes by day.
+    - cron: "17 23,2 * * *"           # night
+    - cron: "41 0,4 * * *"            # night
+    - cron: "9,36 5-9 * * *"          # morning
+    - cron: "14,29,53 10-14 * * *"    # daytime
+    - cron: "4,32 15-21 * * *"        # evening
+    - cron: "47 16,19 * * *"          # evening extras
   workflow_dispatch:
     inputs:
       mode:
@@ -10,14 +17,13 @@ on:
         type: choice
         default: probe
         options:
-          - probe       # log in with the code, look at the calendar, stop
+          - probe       # log in for every booking, show what the page says, change nothing
           - test-email  # send a test email and check the inbox can be read
-          - dry-run     # full check; if a slot is free, select it but don't book
+          - dry-run     # full check; if an earlier slot is free, select it but don't book
           - normal      # the real thing (same as the schedule)
 
 permissions:
   contents: read
-  actions: write  # lets the script disable this workflow after it has booked
 
 concurrency:
   group: appointment-checker
@@ -28,7 +34,7 @@ jobs:
     # Scheduled runs only start once you set the repository variable CHECKER_ENABLED=true
     if: github.event_name == 'workflow_dispatch' || vars.CHECKER_ENABLED == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -47,7 +53,7 @@ jobs:
 
       - run: python -m playwright install --with-deps chromium
 
-      # state/ remembers a booking, failure counts and sent notices between runs
+      # state/ remembers each booking's current date between runs
       - name: Restore state
         uses: actions/cache/restore@v4
         with:
@@ -61,15 +67,18 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
-          BOOKING_NUMBER: ${{ secrets.BOOKING_NUMBER }}
+          BOOKINGS: ${{ secrets.BOOKINGS }}
           BOOKING_URL: ${{ secrets.BOOKING_URL }}
-          BOOKING_EMAIL: ${{ secrets.BOOKING_EMAIL }}   # NEW secret: email used on the booking
+          BOOKING_NUMBER: ${{ secrets.BOOKING_NUMBER }}   # optional: old single-booking fallback
+          BOOKING_EMAIL: ${{ secrets.BOOKING_EMAIL }}     # the shared booking email
           AUTO_BOOK: ${{ vars.AUTO_BOOK || 'true' }}
           DATE_FROM: ${{ vars.DATE_FROM || '2026-12-30' }}
-          DATE_TO: ${{ vars.DATE_TO || '2027-01-15' }}
+          DATE_TO: ${{ vars.DATE_TO || '2027-01-31' }}
+          DAILY_MAX_TOTAL: ${{ vars.DAILY_MAX_TOTAL || '48' }}
+          DAILY_MAX_PER_PERSON: ${{ vars.DAILY_MAX_PER_PERSON || '12' }}
+          START_JITTER_SECONDS: ${{ vars.START_JITTER_SECONDS || '120' }}
           IMAP_HOST: ${{ vars.IMAP_HOST }}
           SMTP_HOST: ${{ vars.SMTP_HOST }}
-          GH_TOKEN: ${{ github.token }}
           MODE: ${{ inputs.mode || 'normal' }}
         run: |
           case "$MODE" in
