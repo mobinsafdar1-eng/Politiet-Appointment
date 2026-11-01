@@ -71,8 +71,9 @@ def _subject_of(msg):
         return msg.get("Subject", "") or ""
 
 
-def fetch_code(since, timeout=150, poll=8):
-    """Wait for a verification-code email that arrived after `since` (UTC datetime)."""
+def fetch_code(since, booking_number=None, timeout=150, poll=8):
+    """Wait for a verification-code email that arrived after `since` (UTC datetime).
+    If booking_number is given, only an email mentioning that number is accepted."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -93,7 +94,10 @@ def fetch_code(since, timeout=150, poll=8):
                     continue
                 if sent < since - timedelta(seconds=60):
                     continue
-                code = _find_code(_subject_of(msg) + "\n" + _text_of(msg))
+                full = _subject_of(msg) + "\n" + _text_of(msg)
+                if booking_number and str(booking_number) not in full:
+                    continue
+                code = _find_code(full)
                 if code:
                     imap.logout()
                     return code
